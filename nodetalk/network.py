@@ -2,18 +2,19 @@
 
 import asyncio
 import json
-from typing import Dict
 
 import websockets
 
 from .config import NODES, PORT
 
 
-async def handle_incoming(websocket: websockets.WebSocketServerProtocol, path: str, node_id: str) -> None:
+async def handle_incoming(websocket, node_id: str):
     """
     Handle incoming messages from other peers.
 
     For now: just print what we receive.
+    Compatible with newer websockets versions where the handler
+    is called with a single 'connection' argument.
     """
     remote = websocket.remote_address
     print(f"[{node_id}] Incoming connection from {remote}")
@@ -31,7 +32,7 @@ async def handle_incoming(websocket: websockets.WebSocketServerProtocol, path: s
         print(f"[{node_id}] Incoming connection closed from {remote}")
 
 
-async def connect_to_peer(node_id: str, peer_id: str, peer_host: str) -> None:
+async def connect_to_peer(node_id: str, peer_id: str, peer_host: str):
     """
     Outgoing connection loop to a single peer.
 
@@ -70,7 +71,7 @@ async def connect_to_peer(node_id: str, peer_id: str, peer_host: str) -> None:
             await asyncio.sleep(3)
 
 
-async def run_node(node_id: str) -> None:
+async def run_node(node_id: str):
     """
     Start this node:
 
@@ -83,8 +84,10 @@ async def run_node(node_id: str) -> None:
     print(f"[{node_id}] Starting WebSocket server on port {PORT}...")
 
     # Start WebSocket server. Bind to all interfaces.
+    # Newer websockets versions call the handler with a single 'connection'
+    # argument, so we wrap our handler to pass node_id via default arg.
     server = await websockets.serve(
-        lambda ws, path: handle_incoming(ws, path, node_id),
+        lambda conn, nid=node_id: handle_incoming(conn, nid),
         host="0.0.0.0",
         port=PORT,
     )
