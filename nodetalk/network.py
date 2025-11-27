@@ -7,14 +7,45 @@ import websockets
 
 from .config import NODES, PORT
 
+# Simple in-memory message list for this node.
+# Later this will become a replicated log + state machine.
+MESSAGES = []  # list of dicts: {"type": "chat", "from": ..., "text": ..., ...}
+
+
+async def broadcast_chat_to_peers(node_id: str, msg: dict) -> None:
+    """
+    Send a chat message to all other peers once.
+
+    We mark the message as 'replicated': true so that receivers
+    know this came from another peer and do not forward it again.
+    """
+    # Make a copy so we don't mutate the original structure in MESSAGES.
+    out_msg = dict(msg)
+    out_msg["replicated"] = True
+    payload = json.dumps(out_msg)
+
+    for peer_id, peer_host in NODES.items():
+        if peer_id == node_id:
+            continue  # don't send to ourselves
+
+        uri = f"ws://{peer_host}:{PORT}"
+        try:
+            print(f"[{node_id}] Broadcasting chat to {peer_id} at {uri}")
+            async with websockets.connect(uri) as websocket:
+                await websocket.send(payload)
+        except Exception as e:
+            print(f"[{node_id}] Failed to broadcast to {peer_id}: {e}")
+
 
 async def handle_incoming(websocket, node_id: str):
     """
-    Handle incoming messages from other peers.
+    Handle incoming messages from other peers or clients.
 
-    For now: just print what we receive.
-    Compatible with newer websockets versions where the handler
-    is called with a single 'connection' argument.
+    For now:
+      - print everything
+      - if it's a chat message, store it in MESSAGES
+      - if it's a *client-originated* chat (no 'replicated' flag),
+        broadcast it once to the other peers
     """
     remote = websocket.remote_address
     print(f"[{node_id}] Incoming connection from {remote}")
@@ -27,7 +58,26 @@ async def handle_incoming(websocket, node_id: str):
                 print(f"[{node_id}] Received non-JSON: {raw!r}")
                 continue
 
-            print(f"[{node_id}] Received message: {msg}")
+            msg_type = msg.get("type")
+
+            if msg_type == "chat":
+                # Store chat messages locally
+                MESSAGES.append(msg)
+                print(
+                    f"[{node_id}] CHAT from {msg.get('from')}: {msg.get('text')!r} "
+                    f"(total messages here: {len(MESSAGES)})"
+                )
+
+                # If this chat has no 'replicated' flag, it came from a client
+                # (or from outside the cluster). We broadcast it to peers.
+                if not msg.get("replicated", False):
+                    # Fire-and-forget broadcast; don't block this connection
+                    asyncio.create_task(broadcast_chat_to_peers(node_id, msg))
+
+            else:
+                # e.g. "hello" messages between peers
+                print(f"[{node_id}] Received message: {msg}")
+
     except websockets.ConnectionClosed:
         print(f"[{node_id}] Incoming connection closed from {remote}")
 
@@ -84,15 +134,14 @@ async def run_node(node_id: str):
     print(f"[{node_id}] Starting WebSocket server on port {PORT}...")
 
     # Start WebSocket server. Bind to all interfaces.
-    # Newer websockets versions call the handler with a single 'connection'
-    # argument, so we wrap our handler to pass node_id via default arg.
+    # websockets.serve(handler, ...) calls handler(conn) with a single connection arg.
     server = await websockets.serve(
         lambda conn, nid=node_id: handle_incoming(conn, nid),
         host="0.0.0.0",
         port=PORT,
     )
 
-    # Start outgoing connection tasks to other peers.
+    # Start outgoing connection tasks to other peers (for hello/debugging).
     peer_tasks = []
     for peer_id, peer_host in NODES.items():
         if peer_id == node_id:
@@ -102,7 +151,6 @@ async def run_node(node_id: str):
     print(f"[{node_id}] Ready. Peers: {[p for p in NODES.keys() if p != node_id]}")
 
     try:
-        # Run until interrupted. The peer_tasks are infinite loops.
         await asyncio.gather(*peer_tasks)
     finally:
         server.close()
