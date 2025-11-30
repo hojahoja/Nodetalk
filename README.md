@@ -166,7 +166,8 @@ If all three nodes show “Sent hello …” and “Received …” messages inv
 
 ### 4.4 With Shell Scripts
 
-Run `serverpush.sh` to update the server with local changes from your files.
+Run `serverpush.sh` to update the server with local changes from your files. On first run it will ask for your username and add them to a local .env file. On subsequent runs it will check for your username in the .env.
+
 
 `start.sh` will start the main process on each server with unique node ID and leaves them running. It will create a .txt file to track the process id on each server.
 
