@@ -163,3 +163,14 @@ If all three nodes show “Sent hello …” and “Received …” messages inv
 
 ```
 ```
+
+### 4.4 With Shell Scripts
+
+Run `serverpush.sh` to update the server with local changes from your files.
+
+`start.sh` will start the main process on each server with unique node ID and leaves them running. It will create a .txt file to track the process id on each server.
+
+`stop.sh` will check all the create .txt files and close the running processes
+on each server. After closing each server the corresponding .txt file will be deleted.
+
+

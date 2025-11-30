@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local variables
+.env
+
+# Temp pid trackers
+pid_svm-11*
