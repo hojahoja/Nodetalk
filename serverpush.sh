@@ -42,6 +42,7 @@ update-nd () {
     "${REMOTE_USER}@${DESTINATION}:${DEST_DIR}/"
 }
 
+# Run rsync for all nodes
 for DESTINATION in svm-11{,-2,-3}.cs.helsinki.fi; do
     echo -e "${GREEN}updating${REGULAR} $DESTINATION..."
     update-nd

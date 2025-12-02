@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from re import M
+from uuid import uuid4
 
 import websockets
 
@@ -21,6 +23,7 @@ async def broadcast_chat_to_peers(node_id: str, msg: dict) -> None:
     """
     # Make a copy so we don't mutate the original structure in MESSAGES.
     out_msg = dict(msg)
+    out_msg["id"] = out_msg.get("id") or str(uuid4())
     out_msg["replicated"] = True
     payload = json.dumps(out_msg)
 
@@ -33,6 +36,14 @@ async def broadcast_chat_to_peers(node_id: str, msg: dict) -> None:
             print(f"[{node_id}] Broadcasting chat to {peer_id} at {uri}")
             async with websockets.connect(uri) as websocket:
                 await websocket.send(payload)
+                # Wait for an ack
+                try:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=2.0)
+                    resp = json.loads(raw)
+                    if resp.get("type") == "ack" and resp.get("id") == out_msg["id"]:
+                        print(f"[{node_id}] Received ack from {peer_id} for {out_msg['id']}")
+                except asyncio.TimeoutError:
+                    print(f"[{node_id}] No ack received from {peer_id} for {out_msg['id']}")
         except Exception as e:
             print(f"[{node_id}] Failed to broadcast to {peer_id}: {e}")
 
@@ -61,19 +72,27 @@ async def handle_incoming(websocket, node_id: str):
             msg_type = msg.get("type")
 
             if msg_type == "chat":
+                # generate unique id for the chat message
+                msg_id = msg.get("id") or str(uuid4())
+                msg["id"] = msg_id
                 # Store chat messages locally
                 MESSAGES.append(msg)
                 print(
                     f"[{node_id}] CHAT from {msg.get('from')}: {msg.get('text')!r} "
-                    f"(total messages here: {len(MESSAGES)})"
+                    f"(total messages here: {len(MESSAGES)})",
+                    f"current messages:\n",
                 )
+                for message in MESSAGES:
+                    print(message)
 
                 # If this chat has no 'replicated' flag, it came from a client
                 # (or from outside the cluster). We broadcast it to peers.
                 if not msg.get("replicated", False):
                     # Fire-and-forget broadcast; don't block this connection
                     asyncio.create_task(broadcast_chat_to_peers(node_id, msg))
-
+                else:
+                    ack = {"type": "ack", "id": msg_id}
+                    await websocket.send(json.dumps(ack))
             else:
                 # e.g. "hello" messages between peers
                 print(f"[{node_id}] Received message: {msg}")
