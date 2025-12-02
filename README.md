@@ -106,6 +106,7 @@ client/
 Python packages:
 
 * `websockets`
+* `python-dotenv`
 
 Install with `uv` (recommended in this repo):
 
@@ -212,12 +213,20 @@ If all three nodes show matching `CHAT` logs with the same text and increasing `
 
 ### 4.4 With Shell Scripts
 
-Run `serverpush.sh` to update the server with local changes from your files. On first run it will ask for your username and add them to a local .env file. On subsequent runs it will check for your username in the .env.
+Run `serverpush.sh` to update the server with local changes from your files. On first run it will ask for your username and add them to a local .env file in the root directory. On subsequent runs it will check for your username in the .env file
 
 `start.sh` will start the main process on each server with unique node ID and leaves them running. It will create a .txt file to track the process id on each server.
 
 `stop.sh` will check all the create .txt files and close the running processes
-on each server. After closing each server the corresponding .txt file will be deleted.
+on each server. After closing each server the corresponding.txt file will be deleted.
+
+### 4.5 Environmental variables
+
+- REMOTE_USER
+  - serverpush saves this variable on first use and will use this for future ssh commands
+- NT_PORT
+  - Set this manually and the server ports will default to this variable.
+  - e.g. NT_PORT=9001
 
 ---
 
