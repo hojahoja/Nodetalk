@@ -19,7 +19,29 @@ COMMITTED_INDEX = -1  # Highest log index that is committed
 LEADER_ID = "A"  # Static for now. Leader election can call set_leader()
 
 # Track active client connections (for future push notifications)
-# ACTIVE_CLIENTS = set()
+ACTIVE_CLIENTS = set()
+
+async def broadcast_chat(message: dict) -> None:
+    """
+    Send a chat message to all currently connected clients on this node.
+    """
+    if not ACTIVE_CLIENTS:
+        return
+
+    payload = json.dumps(message)
+    dead = []
+
+    # Iterate over a copy to avoid modification during iteration
+    for ws in list(ACTIVE_CLIENTS):
+        try:
+            await ws.send(payload)
+        except Exception:
+            # Connection is probably dead; clean it up
+            dead.append(ws)
+
+    for ws in dead:
+        ACTIVE_CLIENTS.discard(ws)
+
 
 
 def get_leader() -> str:
@@ -183,6 +205,9 @@ async def _process_leader_chat(node_id: str, chat_msg: dict, source: str = "clie
             f"(total messages: {len(MESSAGES)})"
         )
 
+        # broadcast committed chat to this node's clients
+        await broadcast_chat(msg_to_store)
+
         # Notify followers to commit
         await notify_commit(node_id, entry)
     else:
@@ -215,7 +240,15 @@ async def handle_incoming(websocket, node_id: str) -> None:
 
             msg_type = msg.get("type")
 
-            if msg_type == "chat":
+
+            if msg_type == "join":
+                # Client announces itself; register and send history
+                ACTIVE_CLIENTS.add(websocket)
+                print(f"[{node_id}] Client joined, sending {len(MESSAGES)} history messages")
+                for message in MESSAGES:
+                    await websocket.send(json.dumps(message))
+
+            elif msg_type == "chat":
                 # Client sends a chat message to this node
                 if get_leader() != node_id:
                     # We are a follower, forward to leader
@@ -225,6 +258,7 @@ async def handle_incoming(websocket, node_id: str) -> None:
 
                 # We are the LEADER: process the chat
                 await _process_leader_chat(node_id, msg, source="client")
+            
 
             elif msg_type == "forward":
                 # Follower forwarded a client chat to us (the leader)
@@ -273,7 +307,11 @@ async def handle_incoming(websocket, node_id: str) -> None:
                                 f"[{node_id}] CHAT from {entry.get('from')}: {entry.get('text')!r} "
                                 f"(total messages: {len(MESSAGES)})"
                             )
+
+                            # NEW: broadcast committed chat to this node's clients
+                            await broadcast_chat(msg_to_store)
                         break
+
 
             elif msg_type == "hello":
                 # Peer hello message (unchanged)
@@ -293,8 +331,9 @@ async def handle_incoming(websocket, node_id: str) -> None:
 
     except websockets.ConnectionClosed:
         print(f"[{node_id}] Incoming connection closed from {remote}")
-    # finally:
-    #     ACTIVE_CLIENTS.discard(websocket)
+    finally:
+        # Remove this websocket from active clients if it was one
+        ACTIVE_CLIENTS.discard(websocket)
 
 
 async def connect_to_peer(node_id: str, peer_id: str, peer_host: str):

@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-
 import websockets
 
 # Hard-coded server details
@@ -37,7 +36,7 @@ async def send_loop(websocket: websockets.WebSocketClientProtocol, sender: str) 
         }
 
         await websocket.send(json.dumps(msg))
-        print(f"[{sender}] sent: {text}")
+        # print(f"[{sender}] sent: {text}")
 
 
 async def receive_loop(websocket: websockets.WebSocketClientProtocol) -> None:
@@ -61,7 +60,6 @@ async def receive_loop(websocket: websockets.WebSocketClientProtocol) -> None:
             if msg_type == "ack":
                 print(f"[server] ack for message id={msg.get('id')}")
             elif msg_type == "chat":
-                # If later we broadcast chats back to clients, handle them here.
                 print(f"[chat] {msg.get('from')}: {msg.get('text')}")
             else:
                 print(f"[server] {msg}")
@@ -79,6 +77,12 @@ async def run_client() -> None:
     try:
         async with websockets.connect(uri) as websocket:
             print(f"[client:{sender}] Connected. You can start chatting.")
+
+            # register with the server and get history
+            await websocket.send(json.dumps({
+                "type": "join",
+                "from": sender,
+            }))
 
             # One task for sending, one for receiving
             send_task = asyncio.create_task(send_loop(websocket, sender))
