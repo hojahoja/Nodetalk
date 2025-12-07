@@ -107,8 +107,12 @@ Python packages:
 
 * `websockets`
 * `python-dotenv`
+* `streamlit` (optional)
 
-Install with `uv` (recommended in this repo):
+Regular dependencies will get installed and synced automatically when using `uv run`\
+Install new dependencies with `uv` (recommended in this repo)
+
+For example:
 
 ```bash
 uv add websockets
@@ -118,6 +122,11 @@ Or with `pip`:
 
 ```bash
 pip install websockets
+```
+
+Streamlit is an optional dependency and needs to be installed with:
+```bash
+uv sync --extra webui
 ```
 
 ---

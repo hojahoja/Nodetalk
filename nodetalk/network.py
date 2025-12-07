@@ -21,6 +21,7 @@ LEADER_ID = "A"  # Static for now. Leader election can call set_leader()
 # Track active client connections (for future push notifications)
 ACTIVE_CLIENTS = set()
 
+
 async def broadcast_chat(message: dict) -> None:
     """
     Send a chat message to all currently connected clients on this node.
@@ -41,7 +42,6 @@ async def broadcast_chat(message: dict) -> None:
 
     for ws in dead:
         ACTIVE_CLIENTS.discard(ws)
-
 
 
 def get_leader() -> str:
@@ -215,18 +215,89 @@ async def _process_leader_chat(node_id: str, chat_msg: dict, source: str = "clie
         print(f"[{node_id}] Entry {entry['id']} FAILED to reach majority")
 
 
+async def sync_from_leader(node_id: str) -> None:
+    """
+    On node startup, request log from the current leader and catch up.
+    Assumes leader is stable and authoritative.
+    """
+    global LOG, MESSAGES, COMMITTED_INDEX
+
+    leader = get_leader()
+    if leader == node_id:
+        # We are the leader, no need to sync
+        print(f"[{node_id}] I am the leader, skipping sync")
+        return
+
+    leader_host = NODES.get(leader)
+    if not leader_host:
+        print(f"[{node_id}] ERROR: Unknown leader {leader}")
+        return
+
+    print(f"[{node_id}] Starting log sync from leader {leader}...")
+
+    uri = f"ws://{leader_host}:{PORT}"
+    try:
+        async with websockets.connect(uri, close_timeout=5.0) as ws:
+            await ws.send(json.dumps({"type": "sync_request", "from": node_id}))
+
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                resp = json.loads(raw)
+
+                if resp.get("type") != "sync_response":
+                    print(f"[{node_id}] Unexpected response from leader: {resp.get('type')}")
+                    return
+
+                leader_log = resp.get("log", [])
+                leader_committed_index = resp.get("committed_index", -1)
+
+                print(
+                    f"[{node_id}] Received log from leader: {len(leader_log)} entries, committed_index={leader_committed_index}"
+                )
+
+                # Replace our log with leader's log (leader is source of truth)
+                LOG.clear()
+                LOG.extend(leader_log)
+                COMMITTED_INDEX = leader_committed_index
+
+                # Apply committed entries to MESSAGES
+                MESSAGES.clear()
+                for i, entry in enumerate(LOG):
+                    if i <= COMMITTED_INDEX and entry.get("committed", False):
+                        msg = entry_to_message(entry)
+                        MESSAGES.append(msg)
+
+                print(
+                    f"[{node_id}] Sync complete: {len(LOG)} log entries, {len(MESSAGES)} committed messages"
+                )
+
+            except asyncio.TimeoutError:
+                print(f"[{node_id}] Sync request to leader {leader} timed out")
+            except json.JSONDecodeError:
+                print(f"[{node_id}] Invalid JSON response from leader")
+
+    except Exception as e:
+        print(f"[{node_id}] Failed to sync from leader {leader}: {e}")
+        print(f"[{node_id}] Starting with empty state")
+
+
 async def handle_incoming(websocket, node_id: str) -> None:
     """
     Handle incoming messages from other peers or clients.
 
     Message types:
+      - "join": client announces itself and requests history
       - "chat": client sends a chat (any node accepts)
       - "forward": follower forwards client chat to leader
       - "replicate": leader sends log entry to follower
       - "ack": follower acknowledges replication
       - "commit": leader tells follower to apply entry
+      - "sync_request": peer requests log for catch-up (leader only responds)
       - "hello": peer greeting
     """
+
+    global LOG, MESSAGES, COMMITTED_INDEX
+
     remote = websocket.remote_address
     print(f"[{node_id}] Incoming connection from {remote}")
 
@@ -240,13 +311,41 @@ async def handle_incoming(websocket, node_id: str) -> None:
 
             msg_type = msg.get("type")
 
-
             if msg_type == "join":
                 # Client announces itself; register and send history
                 ACTIVE_CLIENTS.add(websocket)
                 print(f"[{node_id}] Client joined, sending {len(MESSAGES)} history messages")
                 for message in MESSAGES:
                     await websocket.send(json.dumps(message))
+
+            elif msg_type == "sync_request":
+                # Peer requests log for catch-up
+                # Only leader should respond with authoritative log
+                requester = msg.get("from", "unknown")
+
+                if get_leader() != node_id:
+                    # We are not the leader, reject sync request
+                    print(f"[{node_id}] Sync request from {requester}, but I'm not the leader")
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "sync_error",
+                                "reason": f"Not leader. Leader is {get_leader()}",
+                            }
+                        )
+                    )
+                else:
+                    # We are the leader, send our authoritative log
+                    print(f"[{node_id}] Sync request from {requester}, sending log")
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "sync_response",
+                                "log": LOG,
+                                "committed_index": COMMITTED_INDEX,
+                            }
+                        )
+                    )
 
             elif msg_type == "chat":
                 # Client sends a chat message to this node
@@ -258,7 +357,6 @@ async def handle_incoming(websocket, node_id: str) -> None:
 
                 # We are the LEADER: process the chat
                 await _process_leader_chat(node_id, msg, source="client")
-            
 
             elif msg_type == "forward":
                 # Follower forwarded a client chat to us (the leader)
@@ -308,10 +406,9 @@ async def handle_incoming(websocket, node_id: str) -> None:
                                 f"(total messages: {len(MESSAGES)})"
                             )
 
-                            # NEW: broadcast committed chat to this node's clients
+                            # broadcast committed chat to this node's clients
                             await broadcast_chat(msg_to_store)
                         break
-
 
             elif msg_type == "hello":
                 # Peer hello message (unchanged)
@@ -379,8 +476,9 @@ async def run_node(node_id: str):
     """
     Start this node:
 
-      1. WebSocket server on PORT
-      2. Outgoing connections to all other peers
+      1. Sync log from leader (catch up after restart)
+      2. WebSocket server on PORT
+      3. Outgoing connections to all other peers
     """
     if node_id not in NODES:
         raise SystemExit(f"Unknown node_id {node_id!r}. Use one of {list(NODES.keys())}")
@@ -388,15 +486,17 @@ async def run_node(node_id: str):
     print(f"[{node_id}] Starting WebSocket server on port {PORT}...")
     print(f"[{node_id}] Current leader: {get_leader()}")
 
-    # Start WebSocket server. Bind to all interfaces.
-    # websockets.serve(handler, ...) calls handler(conn) with a single connection arg.
+    # Sync log from leader on startup (before accepting clients)
+    await sync_from_leader(node_id)
+
+    # Start WebSocket server
     server = await websockets.serve(
         lambda conn, nid=node_id: handle_incoming(conn, nid),
         host="0.0.0.0",
         port=PORT,
     )
 
-    # Start outgoing connection tasks to other peers (for hello/debugging).
+    # Start outgoing connection tasks to other peers
     peer_tasks = []
     for peer_id, peer_host in NODES.items():
         if peer_id == node_id:

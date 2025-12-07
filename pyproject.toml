@@ -8,3 +8,8 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "websockets>=15.0.1",
 ]
+
+[project.optional-dependencies]
+webui = [
+    "streamlit>=1.52.1",
+]
