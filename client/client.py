@@ -5,7 +5,8 @@ import json
 import websockets
 
 # Hard-coded server details
-SERVER_HOST = "svm-11.cs.helsinki.fi"  # change here if needed (e.g. "localhost" with SSH tunnel)
+# SERVER_HOST = "svm-11.cs.helsinki.fi"  # change here if needed (e.g. "localhost" with SSH tunnel)
+SERVER_HOST = "localhost"  # change here if needed (e.g. "localhost" with SSH tunnel)
 DEFAULT_PORT = 9000                    # must match NT_PORT / server port
 
 
