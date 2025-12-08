@@ -10,6 +10,7 @@ from .config import NODES, PORT
 
 # Log: ordered list of entries with commit status
 LOG = []
+LOG_INDEX = {}  # id -> index in LOG for faster lookups and deduplication
 
 # Committed messages: only these are visible to clients
 MESSAGES = []
@@ -66,9 +67,33 @@ def entry_to_message(entry: dict) -> dict:
     }
 
 
+async def _replicate_to_single_peer(
+    node_id: str, peer_id: str, peer_host: str, entry: dict
+) -> bool:
+    """Helper: replicate to one peer, return True if ACKed."""
+    uri = f"ws://{peer_host}:{PORT}"
+    payload = json.dumps({"type": "replicate", "entry": entry})
+
+    try:
+        async with websockets.connect(uri, close_timeout=2.0) as ws:
+            await ws.send(payload)
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                resp = json.loads(raw)
+                if resp.get("type") == "ack" and resp.get("entry_id") == entry["id"]:
+                    print(f"[{node_id}] ACK from {peer_id} for {entry['id']}")
+                    return True
+            except asyncio.TimeoutError:
+                print(f"[{node_id}] No ACK from {peer_id} for {entry['id']}")
+    except Exception as e:
+        print(f"[{node_id}] Failed to replicate to {peer_id}: {e}")
+
+    return False
+
+
 async def replicate_to_followers(node_id: str, entry: dict) -> bool:
     """
-    Leader: replicate entry to all followers and wait for majority ACKs.
+    Leader: replicate entry to all followers IN PARALLEL and wait for majority ACKs.
 
     Returns True if majority (including self) ACKed, False otherwise.
     For 3 nodes, need 2 ACKs total (self + 1 follower).
@@ -77,32 +102,23 @@ async def replicate_to_followers(node_id: str, entry: dict) -> bool:
     total_nodes = len(NODES)
     majority = (total_nodes // 2) + 1
 
-    payload = json.dumps(
-        {
-            "type": "replicate",
-            "entry": entry,
-        }
-    )
-
+    # Parallel replication to all followers
+    tasks = []
+    peer_ids = []
     for peer_id, peer_host in NODES.items():
-        if peer_id == node_id:
-            continue
-
-        uri = f"ws://{peer_host}:{PORT}"
-        try:
+        if peer_id != node_id:
             print(f"[{node_id}] Replicating entry {entry['id']} to {peer_id}")
-            async with websockets.connect(uri, close_timeout=2.0) as ws:
-                await ws.send(payload)
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                    resp = json.loads(raw)
-                    if resp.get("type") == "ack" and resp.get("entry_id") == entry["id"]:
-                        ack_count += 1
-                        print(f"[{node_id}] ACK from {peer_id} for {entry['id']}")
-                except asyncio.TimeoutError:
-                    print(f"[{node_id}] No ACK from {peer_id} for {entry['id']}")
-        except Exception as e:
-            print(f"[{node_id}] Failed to replicate to {peer_id}: {e}")
+            tasks.append(_replicate_to_single_peer(node_id, peer_id, peer_host, entry))
+            peer_ids.append(peer_id)
+
+    # Await all replication attempts
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for peer_id, result in zip(peer_ids, results):
+            if result is True:
+                ack_count += 1
+            elif isinstance(result, Exception):
+                print(f"[{node_id}] Exception replicating to {peer_id}: {result}")
 
     has_majority = ack_count >= majority
     print(
@@ -111,28 +127,34 @@ async def replicate_to_followers(node_id: str, entry: dict) -> bool:
     return has_majority
 
 
+async def _notify_single_peer(node_id: str, peer_id: str, peer_host: str, entry_id: str) -> None:
+    """Helper: notify one peer of commit (fire-and-forget)."""
+    uri = f"ws://{peer_host}:{PORT}"
+    payload = json.dumps({"type": "commit", "entry_id": entry_id})
+
+    try:
+        async with websockets.connect(uri, close_timeout=1.0) as ws:
+            await ws.send(payload)
+            print(f"[{node_id}] Notified {peer_id} to commit {entry_id}")
+    except Exception as e:
+        print(f"[{node_id}] Failed to notify commit to {peer_id}: {e}")
+
+
 async def notify_commit(node_id: str, entry: dict) -> None:
     """
-    Leader: notify followers that an entry is committed.
+    Leader: notify followers that an entry is committed IN PARALLEL.
     Followers will then apply it to their MESSAGES list.
     """
-    payload = json.dumps(
-        {
-            "type": "commit",
-            "entry_id": entry["id"],
-        }
-    )
+    entry_id = entry["id"]
 
+    # Parallel fire-and-forget notifications
+    tasks = []
     for peer_id, peer_host in NODES.items():
-        if peer_id == node_id:
-            continue
-        uri = f"ws://{peer_host}:{PORT}"
-        try:
-            async with websockets.connect(uri, close_timeout=1.0) as ws:
-                await ws.send(payload)
-                print(f"[{node_id}] Notified {peer_id} to commit {entry['id']}")
-        except Exception as e:
-            print(f"[{node_id}] Failed to notify commit to {peer_id}: {e}")
+        if peer_id != node_id:
+            tasks.append(_notify_single_peer(node_id, peer_id, peer_host, entry_id))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def forward_to_leader(node_id: str, chat_msg: dict) -> None:
@@ -186,7 +208,8 @@ async def _process_leader_chat(node_id: str, chat_msg: dict, source: str = "clie
         "committed": False,
     }
     LOG.append(entry)
-    print(f"[{node_id}] Leader appended {source} entry {entry['id']} to log")
+    LOG_INDEX[entry["id"]] = len(LOG) - 1
+    print(f"[{node_id}] Leader appended {source} entry {entry['id']} to log (index {len(LOG)-1})")
 
     # Replicate to followers
     has_majority = await replicate_to_followers(node_id, entry)
@@ -259,6 +282,13 @@ async def sync_from_leader(node_id: str) -> None:
                 LOG.clear()
                 LOG.extend(leader_log)
                 COMMITTED_INDEX = leader_committed_index
+
+                # Rebuild LOG_INDEX from synced log
+                LOG_INDEX.clear()
+                for idx, entry in enumerate(LOG):
+                    entry_id = entry.get("id")
+                    if entry_id:
+                        LOG_INDEX[entry_id] = idx
 
                 # Apply committed entries to MESSAGES
                 MESSAGES.clear()
@@ -371,10 +401,13 @@ async def handle_incoming(websocket, node_id: str) -> None:
                 entry = msg.get("entry", {})
                 entry_id = entry.get("id")
 
-                # Check if already in log
-                if entry_id not in [e["id"] for e in LOG]:
+                # deduplication check
+                if entry_id and entry_id not in LOG_INDEX:
                     LOG.append(entry)
-                    print(f"[{node_id}] Follower appended entry {entry_id} from leader")
+                    LOG_INDEX[entry_id] = len(LOG) - 1
+                    print(
+                        f"[{node_id}] Follower appended entry {entry_id} from leader (index {len(LOG)-1})"
+                    )
 
                 # ACK back to leader
                 await websocket.send(
@@ -390,25 +423,30 @@ async def handle_incoming(websocket, node_id: str) -> None:
                 # FOLLOWER: leader tells us to commit entry
                 entry_id = msg.get("entry_id")
 
-                # Find entry in log and mark committed
-                for entry in LOG:
-                    if entry["id"] == entry_id:
+                # Look up entry in our log
+                entry_idx = LOG_INDEX.get(entry_id)
+                if entry_idx is not None and entry_idx < len(LOG):
+                    entry = LOG[entry_idx]
+
+                    if not entry.get("committed", False):  # Only commit once
                         entry["committed"] = True
-                        COMMITTED_INDEX = LOG.index(entry)
-                        print(f"[{node_id}] Entry {entry_id} committed by leader")
+                        COMMITTED_INDEX = entry_idx
+                        print(
+                            f"[{node_id}] Entry {entry_id} committed by leader (index {entry_idx})"
+                        )
 
                         # Apply to state machine
                         msg_to_store = entry_to_message(entry)
-                        if msg_to_store not in MESSAGES:
-                            MESSAGES.append(msg_to_store)
-                            print(
-                                f"[{node_id}] CHAT from {entry.get('from')}: {entry.get('text')!r} "
-                                f"(total messages: {len(MESSAGES)})"
-                            )
+                        MESSAGES.append(msg_to_store)
+                        print(
+                            f"[{node_id}] CHAT from {entry.get('from')}: {entry.get('text')!r} "
+                            f"(total messages: {len(MESSAGES)})"
+                        )
 
-                            # broadcast committed chat to this node's clients
-                            await broadcast_chat(msg_to_store)
-                        break
+                        # broadcast committed chat to this node's clients
+                        await broadcast_chat(msg_to_store)
+                else:
+                    print(f"[{node_id}] Commit entry {entry_id} not found in log")
 
             elif msg_type == "hello":
                 # Peer hello message (unchanged)
@@ -486,15 +524,15 @@ async def run_node(node_id: str):
     print(f"[{node_id}] Starting WebSocket server on port {PORT}...")
     print(f"[{node_id}] Current leader: {get_leader()}")
 
-    # Sync log from leader on startup (before accepting clients)
-    await sync_from_leader(node_id)
-
     # Start WebSocket server
     server = await websockets.serve(
         lambda conn, nid=node_id: handle_incoming(conn, nid),
         host="0.0.0.0",
         port=PORT,
     )
+
+    # Sync log from leader on startup (before accepting clients)
+    await sync_from_leader(node_id)
 
     # Start outgoing connection tasks to other peers
     peer_tasks = []

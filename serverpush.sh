@@ -30,6 +30,7 @@ EXCLUDES=(
     "--exclude=$(basename "$0")"
     "--exclude=start.sh"
     "--exclude=stop.sh"
+    "--exclude=tunnel.sh"
     "--exclude=pid_svm-11*"
 )
 
