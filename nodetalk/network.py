@@ -3,6 +3,7 @@
 import asyncio
 import json
 from uuid import uuid4
+import time
 
 import websockets
 
@@ -22,6 +23,125 @@ LEADER_ID = "A"  # Static for now. Leader election can call set_leader()
 # Track active client connections (for future push notifications)
 ACTIVE_CLIENTS = set()
 
+LEADER_ID = None
+IS_LEADER = False
+LAST_HEARTBEAT = time.time()
+ELECTION_IN_PROGRESS = False
+
+PEER_CONNECTIONS = {}
+
+async def leader_heartbeat(node_id: str):
+    """Runs only on the leader: broadcasts heartbeat every second."""
+    global LEADER_ID, IS_LEADER
+
+    while True:
+        await asyncio.sleep(1.0)
+        if IS_LEADER:
+            msg = {"type": "heartbeat", "from": node_id}
+            await broadcast_control_to_peers(node_id, msg)
+
+async def broadcast_control_to_peers(node_id: str, msg: dict):
+    payload = json.dumps(msg)
+    for peer_id, websocket in PEER_CONNECTIONS.items():
+        if peer_id == node_id:
+            continue
+        try:
+            await websocket.send(payload)
+        except Exception:
+            print(f"[{node_id}] Failed to send heartbeat to {peer_id}")
+            PEER_CONNECTIONS.pop(peer_id, None)
+
+async def monitor_heartbeat(node_id: str):
+    global LAST_HEARTBEAT, IS_LEADER, LEADER_ID, ELECTION_IN_PROGRESS
+
+    while True:
+        await asyncio.sleep(2.0)
+
+        if IS_LEADER:
+            continue  # leader does not expect heartbeats
+
+        # Check if leader has timed out
+        time_since_heartbeat = time.time() - LAST_HEARTBEAT
+        
+        if not IS_LEADER and LEADER_ID is not None and time_since_heartbeat > 5.0:
+            # Only start election if one isn't already in progress
+            if not ELECTION_IN_PROGRESS:
+                print(f"[{node_id}] Leader timeout detected! Last heartbeat {time_since_heartbeat:.1f}s ago")
+                print(f"[{node_id}] Starting election...")
+                asyncio.create_task(start_election(node_id))
+
+def is_higher(node_a, node_b):
+    return node_a > node_b
+
+async def start_election(node_id: str):
+    global ELECTION_IN_PROGRESS, IS_LEADER, LEADER_ID
+
+    if ELECTION_IN_PROGRESS or IS_LEADER:
+        print(f"[{node_id}] Election already in progress or I'm leader, skipping")
+        return
+
+    ELECTION_IN_PROGRESS = True
+    print(f"[{node_id}] Sending ELECTION to higher nodes...")
+    msg = {"type": "election", "from": node_id}
+
+    heard_back = False
+
+    for peer_id, peer_host in NODES.items():
+        if is_higher(peer_id, node_id):
+            try:
+                async with websockets.connect(f"ws://{peer_host}:{PORT}", close_timeout=2.0) as ws:
+                    await ws.send(json.dumps(msg))
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        r = json.loads(raw)
+                        if r.get("type") == "election_ok":
+                            heard_back = True
+                            print(f"[{node_id}] Received election_ok from {peer_id}")
+                    except asyncio.TimeoutError:
+                        print(f"[{node_id}] No response from {peer_id}")
+            except Exception as e:
+                print(f"[{node_id}] Could not reach {peer_id}: {e}")
+
+    if not heard_back:
+        print(f"[{node_id}] No higher nodes responded, becoming leader")
+        await become_leader(node_id)
+    else:
+        print(f"[{node_id}] Higher node responded, waiting for coordinator/heartbeat...")
+        await asyncio.sleep(5)
+        
+        # After waiting, check if we got a leader (via coordinator or heartbeat)
+        if LEADER_ID is not None and not IS_LEADER:
+            print(f"[{node_id}] Leader {LEADER_ID} established, canceling election")
+            ELECTION_IN_PROGRESS = False
+        elif not IS_LEADER and ELECTION_IN_PROGRESS:
+            print(f"[{node_id}] No coordinator/heartbeat received, restarting election")
+            ELECTION_IN_PROGRESS = False
+            asyncio.create_task(start_election(node_id))
+        else:
+            ELECTION_IN_PROGRESS = False
+
+
+async def handle_election(msg, node_id):
+    global IS_LEADER, ELECTION_IN_PROGRESS
+    
+    sender = msg["from"]
+    if is_higher(node_id, sender):
+        print(f"[{node_id}] Received election from lower node {sender}")
+        
+        # If we're already the leader, just respond OK and send coordinator
+        if IS_LEADER:
+            print(f"[{node_id}] Already leader, sending coordinator announcement to {sender}")
+            # The response will tell them we're alive
+            # They should receive our heartbeats soon
+            return {"type": "election_ok", "from": node_id}
+        
+        # If not leader and not in election, start our own election
+        if not ELECTION_IN_PROGRESS:
+            print(f"[{node_id}] Starting own election")
+            asyncio.create_task(start_election(node_id))
+        
+        return {"type": "election_ok", "from": node_id}
+    return None
 
 async def broadcast_chat(message: dict) -> None:
     """
@@ -50,11 +170,17 @@ def get_leader() -> str:
     return LEADER_ID
 
 
-def set_leader(node_id: str) -> None:
-    """Set leader. Can be called by election algorithm when leader changes."""
-    global LEADER_ID
+async def become_leader(node_id: str):
+    global IS_LEADER, LEADER_ID, ELECTION_IN_PROGRESS
+    IS_LEADER = True
     LEADER_ID = node_id
-    print(f"[network] Leader is now {node_id}")
+    ELECTION_IN_PROGRESS = False
+
+    print(f"[{node_id}] I am the new leader!")
+
+    # Broadcast coordinator announcement
+    msg = {"type": "coordinator", "from": node_id}
+    await broadcast_control_to_peers(node_id, msg)
 
 
 def entry_to_message(entry: dict) -> dict:
@@ -243,11 +369,15 @@ async def sync_from_leader(node_id: str) -> None:
     On node startup, request log from the current leader and catch up.
     Assumes leader is stable and authoritative.
     """
-    global LOG, MESSAGES, COMMITTED_INDEX
+    global LOG, MESSAGES, COMMITTED_INDEX, LEADER_ID
 
     leader = get_leader()
+    
+    if leader is None:
+        print(f"[{node_id}] No leader yet, skipping sync")
+        return
+        
     if leader == node_id:
-        # We are the leader, no need to sync
         print(f"[{node_id}] I am the leader, skipping sync")
         return
 
@@ -267,6 +397,12 @@ async def sync_from_leader(node_id: str) -> None:
                 raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                 resp = json.loads(raw)
 
+                if resp.get("type") == "sync_error":
+                    print(f"[{node_id}] Sync failed: {resp.get('reason')}")
+                    # Leader might be down, clear LEADER_ID
+                    LEADER_ID = None
+                    return
+
                 if resp.get("type") != "sync_response":
                     print(f"[{node_id}] Unexpected response from leader: {resp.get('type')}")
                     return
@@ -274,9 +410,7 @@ async def sync_from_leader(node_id: str) -> None:
                 leader_log = resp.get("log", [])
                 leader_committed_index = resp.get("committed_index", -1)
 
-                print(
-                    f"[{node_id}] Received log from leader: {len(leader_log)} entries, committed_index={leader_committed_index}"
-                )
+                print(f"[{node_id}] Received log from leader: {len(leader_log)} entries")
 
                 # Replace our log with leader's log (leader is source of truth)
                 LOG.clear()
@@ -297,18 +431,15 @@ async def sync_from_leader(node_id: str) -> None:
                         msg = entry_to_message(entry)
                         MESSAGES.append(msg)
 
-                print(
-                    f"[{node_id}] Sync complete: {len(LOG)} log entries, {len(MESSAGES)} committed messages"
-                )
+                print(f"[{node_id}] Sync complete: {len(MESSAGES)} committed messages")
 
             except asyncio.TimeoutError:
-                print(f"[{node_id}] Sync request to leader {leader} timed out")
-            except json.JSONDecodeError:
-                print(f"[{node_id}] Invalid JSON response from leader")
+                print(f"[{node_id}] Sync request timed out, leader might be down")
+                LEADER_ID = None
 
     except Exception as e:
-        print(f"[{node_id}] Failed to sync from leader {leader}: {e}")
-        print(f"[{node_id}] Starting with empty state")
+        print(f"[{node_id}] Failed to sync from leader: {e}")
+        LEADER_ID = None
 
 
 async def handle_incoming(websocket, node_id: str) -> None:
@@ -326,7 +457,7 @@ async def handle_incoming(websocket, node_id: str) -> None:
       - "hello": peer greeting
     """
 
-    global LOG, MESSAGES, COMMITTED_INDEX
+    global LOG, MESSAGES, COMMITTED_INDEX, LAST_HEARTBEAT, LEADER_ID, IS_LEADER, ELECTION_IN_PROGRESS
 
     remote = websocket.remote_address
     print(f"[{node_id}] Incoming connection from {remote}")
@@ -452,6 +583,26 @@ async def handle_incoming(websocket, node_id: str) -> None:
                 # Peer hello message (unchanged)
                 print(f"[{node_id}] Received message: {msg}")
 
+            elif msg_type == "heartbeat":
+                LAST_HEARTBEAT = time.time()
+                LEADER_ID = msg["from"]
+
+            elif msg_type == "election":
+                resp = await handle_election(msg, node_id)
+                if resp:
+                    await websocket.send(json.dumps(resp))
+
+            elif msg_type == "election_ok":
+                ELECTION_IN_PROGRESS = True
+
+            elif msg_type == "coordinator":
+                sender = msg["from"]
+                IS_LEADER = False
+                LEADER_ID = sender
+                ELECTION_IN_PROGRESS = False
+                LAST_HEARTBEAT = time.time()
+                print(f"[{node_id}] Received coordinator announcement: {LEADER_ID} is now the leader")
+
             else:
                 print(f"[{node_id}] Unknown message type: {msg_type}")
 
@@ -485,11 +636,9 @@ async def connect_to_peer(node_id: str, peer_id: str, peer_host: str):
         try:
             print(f"[{node_id}] Trying to connect to peer {peer_id} at {uri}")
             async with websockets.connect(uri) as websocket:
-                hello = {
-                    "type": "hello",
-                    "from": node_id,
-                    "to": peer_id,
-                }
+                PEER_CONNECTIONS[peer_id] = websocket
+
+                hello = {"type": "hello", "from": node_id, "to": peer_id}
                 await websocket.send(json.dumps(hello))
                 print(f"[{node_id}] Sent hello to {peer_id}")
 
@@ -497,17 +646,14 @@ async def connect_to_peer(node_id: str, peer_id: str, peer_host: str):
                     try:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
-                        print(f"[{node_id}] Received non-JSON from {peer_id}: {raw!r}")
                         continue
-
                     print(f"[{node_id}] Received from {peer_id}: {msg}")
 
-        except (OSError, websockets.InvalidURI, websockets.InvalidHandshake) as e:
+        except Exception as e:
             print(f"[{node_id}] Could not connect to {peer_id} ({e}), retrying in 3s...")
             await asyncio.sleep(3)
-        except websockets.ConnectionClosed:
-            print(f"[{node_id}] Connection to {peer_id} closed, retrying in 3s...")
-            await asyncio.sleep(3)
+        finally:
+            PEER_CONNECTIONS.pop(peer_id, None)
 
 
 async def run_node(node_id: str):
@@ -522,7 +668,7 @@ async def run_node(node_id: str):
         raise SystemExit(f"Unknown node_id {node_id!r}. Use one of {list(NODES.keys())}")
 
     print(f"[{node_id}] Starting WebSocket server on port {PORT}...")
-    print(f"[{node_id}] Current leader: {get_leader()}")
+    #print(f"[{node_id}] Current leader: {get_leader()}")
 
     # Start WebSocket server
     server = await websockets.serve(
@@ -531,15 +677,32 @@ async def run_node(node_id: str):
         port=PORT,
     )
 
-    # Sync log from leader on startup (before accepting clients)
-    await sync_from_leader(node_id)
-
     # Start outgoing connection tasks to other peers
     peer_tasks = []
     for peer_id, peer_host in NODES.items():
         if peer_id == node_id:
             continue
         peer_tasks.append(asyncio.create_task(connect_to_peer(node_id, peer_id, peer_host)))
+
+    asyncio.create_task(leader_heartbeat(node_id))
+    asyncio.create_task(monitor_heartbeat(node_id))
+
+    print(f"[{node_id}] Waiting 3 seconds for peer connections...")
+    await asyncio.sleep(3)
+
+    # Sync log from leader on startup (before accepting clients)
+    await sync_from_leader(node_id)
+
+    if LEADER_ID is None:
+        print(f"[{node_id}] No leader found after sync, waiting 3 more seconds for heartbeats...")
+        await asyncio.sleep(3)
+        
+        # Check again after waiting for heartbeats
+        if LEADER_ID is None:
+            print(f"[{node_id}] Still no leader, starting election")
+            asyncio.create_task(start_election(node_id))
+        else:
+            print(f"[{node_id}] Received heartbeat from leader {LEADER_ID}, no election needed")
 
     print(f"[{node_id}] Ready. Peers: {[p for p in NODES.keys() if p != node_id]}")
 
