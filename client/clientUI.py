@@ -14,7 +14,7 @@ import streamlit as st
 import websockets
 
 # Default server details (you can override in the sidebar)
-SERVER_HOST = "svm-11.cs.helsinki.fi"  # same as before
+SERVER_HOST = "svm-11.cs.helsinki.fi"  # change to "localhost" if needed
 DEFAULT_PORT = 9000                    # must match NT_PORT / server port
 
 
@@ -109,8 +109,7 @@ def start_ws_thread(host: str, port: int, username: str) -> None:
 def drain_incoming() -> None:
     """
     Move messages from the background incoming_queue into
-    session_state.messages (called on each Streamlit rerun),
-    deduplicating by message id.
+    session_state.messages, deduplicating by message id.
     """
     q = st.session_state.get("incoming_queue")
     if not q:
@@ -196,10 +195,7 @@ with st.sidebar:
 st.title("💬 Nodetalk Distributed Chat")
 st.caption("Group chat on top of your replicated log (leader + followers).")
 
-# Pull in any new messages from background worker
-drain_incoming()
-
-# 1) Message input first (so our own messages appear immediately)
+# 1) Message input – we DO NOT locally append; only send to server
 user_text = None
 if st.session_state.connected:
     user_text = st.chat_input("Type your message")
@@ -209,7 +205,7 @@ else:
 if user_text:
     user_text = user_text.strip()
     if user_text:
-        # Create a client-side id so server and client use same id
+        # Give the message a client-side id (server can reuse it or ignore it)
         msg_id = str(uuid.uuid4())
         outgoing = {
             "id": msg_id,
@@ -218,15 +214,14 @@ if user_text:
             "text": user_text,
         }
 
-        # Local echo immediately
-        st.session_state.seen_ids.add(msg_id)
-        st.session_state.messages.append(outgoing)
-
         # Send to server (background thread will pick this up)
         if "send_queue" in st.session_state:
             st.session_state.send_queue.put(outgoing)
 
-# 2) Render chat history
+# 2) Pull in any new messages from background worker (history + broadcasts)
+drain_incoming()
+
+# 3) Render chat history
 chat_container = st.container()
 with chat_container:
     for msg in st.session_state.messages:
@@ -260,7 +255,7 @@ with chat_container:
                 unsafe_allow_html=True,
             )
 
-# 3) Auto-refresh loop so remote messages appear without interaction
+# 4) Auto-refresh loop so remote messages appear without interaction
 if st.session_state.auto_refresh:
     # Short sleep to avoid hammering the server / CPU
     time.sleep(1.0)
@@ -270,4 +265,3 @@ if st.session_state.auto_refresh:
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
-
