@@ -14,7 +14,7 @@ import streamlit as st
 import websockets
 
 # Default server details (you can override in the sidebar)
-SERVER_HOST = "svm-11.cs.helsinki.fi"  # change to "localhost" if needed
+SERVER_HOST = "localhost"  # change to "localhost" if needed
 DEFAULT_PORT = 9000                    # must match NT_PORT / server port
 
 
