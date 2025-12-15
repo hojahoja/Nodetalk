@@ -96,7 +96,8 @@ nodetalk/
   network.py           # WebSocket server, peer connections, in-memory MESSAGES, chat replication
 
 client/
-  client.py            # simple CLI client: connect to a node and send one chat message
+  client.py            # simple CLI client: connect to a node, send and receive messages (for testing purpose)
+  clientUI.py          # streamlit based webui for the client
 ```
 
 ---

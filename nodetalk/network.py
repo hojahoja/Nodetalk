@@ -486,7 +486,13 @@ async def handle_incoming(websocket, node_id: str) -> None:
       - "ack": follower acknowledges replication
       - "commit": leader tells follower to apply entry
       - "sync_request": peer requests log for catch-up (leader only responds)
+      - "sync_response": leader responds with log
+      - "sync_error": could not fulfill sync request
       - "hello": peer greeting
+      - "heartbeat": leader's heartbeat signal
+      - "election": General election process message
+      - "election_ok": Bully algorithm's OK response
+      - "coordinator": Bully algorithm's coordinator announcement
     """
 
     global LOG, MESSAGES, COMMITTED_INDEX, LAST_HEARTBEAT, LEADER_ID, IS_LEADER, ELECTION_IN_PROGRESS
@@ -648,15 +654,6 @@ async def handle_incoming(websocket, node_id: str) -> None:
             else:
                 print(f"[{node_id}] Unknown message type: {msg_type}")
 
-        # # Temp logging
-        # print(f"[{node_id}] Current committed messages:")
-        # for message in MESSAGES:
-        #     print(message)
-        # # print current logs
-        # print(f"[{node_id}] Current log entries:")
-        # for log_entry in LOG:
-        #     print(log_entry)
-
     except websockets.ConnectionClosed:
         print(f"[{node_id}] Incoming connection closed from {remote}")
     finally:
@@ -695,6 +692,8 @@ async def connect_to_peer(node_id: str, peer_id: str, peer_host: str):
             print(f"[{node_id}] Could not connect to {peer_id} ({e}), retrying in 3s...")
             PEER_CONNECTIONS.pop(peer_id, None)  # Clear on error
             await asyncio.sleep(3)
+        # This is unreachable due to the above Exception catch-all, but there's currently no sense in making
+        # Any functionality changes to the code.
         except websockets.ConnectionClosed:
             print(f"[{node_id}] Connection to {peer_id} closed, retrying...")
             PEER_CONNECTIONS.pop(peer_id, None)  # Clear on close
