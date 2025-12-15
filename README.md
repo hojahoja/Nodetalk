@@ -332,3 +332,24 @@ Then:
 
 ```
 ```
+
+---
+
+## 7. Streamlit chat UI (optional)
+
+If you prefer a browser UI instead of the CLI client:
+
+1. Install the optional extras once:  
+   ```bash
+   uv sync --extra webui
+   ```
+2. Make sure at least one Nodetalk server is already running (locally or via the SSH tunnel above).
+3. Launch the UI from your laptop or any machine that can reach the server:  
+   ```bash
+   uv run streamlit run client/clientUI.py
+   ```  
+   (Plain `streamlit run client/clientUI.py` works too if your env is activated.)
+4. In the Streamlit sidebar, set the target host/port (`localhost:9000` when using SSH forwarding) and enter your display name, then click **Connect / Reconnect**.
+5. Type messages using the chat input at the bottom. They are sent through the Nodetalk server and replicated just like the CLI client messages.
+
+Keep the Streamlit page open; it auto-refreshes every second so new remote messages appear without manual interaction.
