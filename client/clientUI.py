@@ -1,8 +1,3 @@
-# client/clientUI.py
-#
-# Streamlit UI client for Nodetalk.
-# Run with: streamlit run client/clientUI.py
-
 import asyncio
 import json
 import threading
@@ -13,15 +8,12 @@ import uuid
 import streamlit as st
 import websockets
 
-# Default server details (you can override in the sidebar)
-SERVER_HOST = "localhost"  # change to "localhost" if needed
-DEFAULT_PORT = 9000                    # must match NT_PORT / server port
+# Default server the UI talks to when it first opens
+SERVER_HOST = "localhost"
+DEFAULT_PORT = 9000
 
 
-# ------------------------------
-# WebSocket worker (background)
-# ------------------------------
-
+# Background task that keeps the chat connection alive
 async def ws_main(
     host: str,
     port: int,
@@ -32,7 +24,7 @@ async def ws_main(
     uri = f"ws://{host}:{port}"
     try:
         async with websockets.connect(uri) as websocket:
-            # Join handshake: server will send full history
+            # Let the server know who just joined
             await websocket.send(json.dumps({
                 "type": "join",
                 "from": username,
@@ -42,6 +34,7 @@ async def ws_main(
                 "text": f"Connected to {uri} as {username}",
             })
 
+            # Ships anything the user writes to the server
             async def sender():
                 while True:
                     try:
@@ -51,11 +44,12 @@ async def ws_main(
                         continue
 
                     if msg is None:
-                        # Shutdown signal
+                        # Stop once the UI asks us to exit
                         break
 
                     await websocket.send(json.dumps(msg))
 
+            # Collects everything the server sends back
             async def receiver():
                 async for raw in websocket:
                     try:
@@ -64,23 +58,20 @@ async def ws_main(
                         msg = {"type": "system", "text": raw}
                     incoming_q.put(msg)
 
+            # Keep sending and receiving running together
             await asyncio.gather(sender(), receiver())
 
     except Exception as e:
+        # Report any connection trouble back to the UI
         incoming_q.put({
             "type": "system",
             "text": f"Connection error: {e}",
         })
 
 
+# Starts the background worker thread so Streamlit stays responsive
 def start_ws_thread(host: str, port: int, username: str) -> None:
-    """
-    Start the background WebSocket thread.
-
-    IMPORTANT: Do NOT access st.session_state inside the thread.
-    Capture the queues as local variables and pass them in.
-    """
-    # Initialize queues in main thread
+    # Make sure the queues exist before launching the worker
     if "send_queue" not in st.session_state:
         st.session_state.send_queue = queue.Queue()
     if "incoming_queue" not in st.session_state:
@@ -106,11 +97,8 @@ def start_ws_thread(host: str, port: int, username: str) -> None:
     st.session_state.connected = True
 
 
+# Pulls buffered messages into the visible chat log
 def drain_incoming() -> None:
-    """
-    Move messages from the background incoming_queue into
-    session_state.messages, deduplicating by message id.
-    """
     q = st.session_state.get("incoming_queue")
     if not q:
         return
@@ -125,25 +113,21 @@ def drain_incoming() -> None:
         if msg_type == "chat":
             msg_id = msg.get("id")
             if msg_id:
-                # skip if already seen
+                # Ignore duplicates we have already shown
                 if msg_id in st.session_state.seen_ids:
                     continue
                 st.session_state.seen_ids.add(msg_id)
 
         st.session_state.messages.append(msg)
 
-
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-
+# Basic page setup for Streamlit
 st.set_page_config(
     page_title="Nodetalk Chat",
     page_icon="💬",
     layout="centered",
 )
 
-# Initialize session state (main thread only)
+# Prepare session storage for this browser tab
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "seen_ids" not in st.session_state:
@@ -155,9 +139,10 @@ if "username" not in st.session_state:
 if "ws_thread" not in st.session_state:
     st.session_state.ws_thread = None
 if "auto_refresh" not in st.session_state:
-    st.session_state.auto_refresh = True  # default on
+    # Auto-refresh starts enabled so new messages appear on their own
+    st.session_state.auto_refresh = True
 
-# Sidebar: connection settings
+# Sidebar controls for joining a server
 with st.sidebar:
     st.markdown("### Connection")
     host = st.text_input("Server host", value=SERVER_HOST)
@@ -179,23 +164,19 @@ with st.sidebar:
         else:
             st.session_state.username = username.strip()
 
-            # Signal old worker to stop (if any)
+            # Ask any previous worker to shut down
             if st.session_state.get("send_queue") is not None:
                 try:
                     st.session_state.send_queue.put_nowait(None)
                 except Exception:
                     pass
 
-            # Optional: clear everything on reconnect
-            # st.session_state.messages = []
-            # st.session_state.seen_ids = set()
-
             start_ws_thread(host, int(port), st.session_state.username)
 
 st.title("💬 Nodetalk Distributed Chat")
 st.caption("Group chat on top of your replicated log (leader + followers).")
 
-# 1) Message input – we DO NOT locally append; only send to server
+# Message input is only active when connected
 user_text = None
 if st.session_state.connected:
     user_text = st.chat_input("Type your message")
@@ -205,7 +186,7 @@ else:
 if user_text:
     user_text = user_text.strip()
     if user_text:
-        # Give the message a client-side id (server can reuse it or ignore it)
+        # Tag the outgoing message with a simple id
         msg_id = str(uuid.uuid4())
         outgoing = {
             "id": msg_id,
@@ -214,14 +195,14 @@ if user_text:
             "text": user_text,
         }
 
-        # Send to server (background thread will pick this up)
+        # Hand the message to the background worker
         if "send_queue" in st.session_state:
             st.session_state.send_queue.put(outgoing)
 
-# 2) Pull in any new messages from background worker (history + broadcasts)
+# Pull in fresh messages from the background worker before rendering
 drain_incoming()
 
-# 3) Render chat history
+# Show the full conversation so far
 chat_container = st.container()
 with chat_container:
     for msg in st.session_state.messages:
@@ -231,14 +212,14 @@ with chat_container:
             sender = msg.get("from", "unknown")
             text = msg.get("text", "")
 
-            # Style your own messages differently
+            # Highlight the local user's own lines
             role = "user" if sender == st.session_state.username else "assistant"
 
             with st.chat_message(role):
                 st.markdown(f"**{sender}**  \n{text}")
 
         elif msg_type == "system":
-            # System / status messages
+            # Center short status notes
             st.markdown(
                 f"<div style='text-align:center; color:gray; font-size:0.85rem;'>"
                 f"{msg.get('text','')}"
@@ -247,7 +228,7 @@ with chat_container:
             )
 
         else:
-            # Fallback for any unusual messages
+            # Show anything unexpected without crashing
             st.markdown(
                 f"<div style='text-align:center; color:#888; font-size:0.8rem;'>"
                 f"[{msg_type}] {msg}"
@@ -255,12 +236,12 @@ with chat_container:
                 unsafe_allow_html=True,
             )
 
-# 4) Auto-refresh loop so remote messages appear without interaction
+# Refresh automatically so remote messages appear on their own
 if st.session_state.auto_refresh:
-    # Short sleep to avoid hammering the server / CPU
+    # Pause briefly so we do not hog the CPU
     time.sleep(1.0)
 
-    # Support both old and new Streamlit versions
+    # Use whichever rerun API this Streamlit build offers
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
